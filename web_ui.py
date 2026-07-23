@@ -9,6 +9,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any, TypedDict
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 from croniter import croniter
@@ -18,10 +19,22 @@ from app.config import STATS_FILE
 from app.config_manager import find_auto_start_configs
 from app.consumer import TrafficConsumer
 
+
+class RuntimeSnapshot(TypedDict):
+    records: list[dict[str, Any]]
+    active_records: list[dict[str, Any]]
+    scheduled_records: list[dict[str, Any]]
+    primary: dict[str, Any] | None
+    thread_count: int
+    config_names: list[str]
+    has_active_download: bool
+    has_active_scheduler: bool
+    has_live_thread: bool
+
 def _bundle_root() -> Path:
     """返回运行时资源根目录；打包版优先使用 PyInstaller 解包目录。"""
     if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS)
+        return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return Path(__file__).resolve().parent
 
 
@@ -65,7 +78,7 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text)
 
 
-def load_stats_records():
+def load_stats_records() -> list[dict[str, Any]]:
     """从 stats.json 读取原始执行记录，并补齐前端展示字段。"""
     if not os.path.exists(STATS_FILE):
         return []
@@ -75,10 +88,10 @@ def load_stats_records():
             stats_data = json.load(f)
 
         temp_consumer = TrafficConsumer()
-        records = []
+        records: list[dict[str, Any]] = []
         for run_id, stats in sorted(stats_data.items(), key=lambda x: x[0], reverse=True):
             total_bytes = int(stats.get('total_bytes', 0) or 0)
-            record = {
+            record: dict[str, Any] = {
                 "run_id": run_id,
                 "config_name": stats.get('config_name') or 'default',
                 "start_time": stats.get('start_time'),
@@ -97,7 +110,7 @@ def load_stats_records():
         return []
 
 
-def load_history_from_stats():
+def load_history_from_stats() -> list[dict[str, Any]]:
     """从 stats.json 加载历史运行记录。"""
     try:
         return load_stats_records()[:50]
@@ -106,38 +119,40 @@ def load_history_from_stats():
         return []
 
 
-def build_stats_summary_by_config():
+def build_stats_summary_by_config() -> dict[str, dict[str, Any]]:
     """按配置聚合历史统计，供计划列表展示累计流量与下载数。"""
-    summary = {}
+    summary: dict[str, dict[str, Any]] = {}
     for record in load_stats_records():
-        config_name = record.get('config_name') or 'default'
+        config_name = str(record.get('config_name') or 'default')
         item = summary.setdefault(config_name, {
             'total_bytes_raw': 0,
             'download_count': 0,
             'history': [],
         })
-        item['total_bytes_raw'] += int(record.get('total_bytes', 0) or 0)
-        item['download_count'] += int(record.get('download_count', 0) or 0)
-        item['history'].append(record)
+        item['total_bytes_raw'] = int(item['total_bytes_raw']) + int(record.get('total_bytes', 0) or 0)
+        item['download_count'] = int(item['download_count']) + int(record.get('download_count', 0) or 0)
+        history: Any = item['history']
+        if isinstance(history, list):
+            history.append(record)
     return summary
 
 
-def build_consumer_kwargs(config_name, config_data, **callbacks):
+def build_consumer_kwargs(config_name: str, config_data: dict[str, Any] | None, **callbacks: Any) -> dict[str, Any]:
     """把前端配置转换为 TrafficConsumer 参数，避免启动和保存两套字段越写越散。"""
     config_data = config_data or {}
     return {
         "urls": config_data.get('urls'),
-        "url_strategy": config_data.get('url_strategy'),
-        "threads": config_data.get('threads'),
-        "limit_speed": config_data.get('limit_speed'),
+        "url_strategy": config_data.get('url_strategy') or "random",
+        "threads": int(config_data.get('threads') or 4),
+        "limit_speed": int(config_data.get('limit_speed') or 0),
         "duration": config_data.get('duration'),
         "count": config_data.get('count'),
         "traffic_limit": config_data.get('traffic_limit'),
         "cron_expr": config_data.get('cron_expr'),
         "interval": config_data.get('interval'),
-        "config_name": config_name or config_data.get('config_name'),
-        "auto_remove_failed_url": config_data.get('auto_remove_failed_url', False),
-        "auto_start": config_data.get('auto_start', False),
+        "config_name": config_name or config_data.get('config_name') or "default",
+        "auto_remove_failed_url": bool(config_data.get('auto_remove_failed_url', False)),
+        "auto_start": bool(config_data.get('auto_start', False)),
         "user_agent": config_data.get('user_agent'),
         "request_headers": config_data.get('request_headers'),
         "url_switch_interval": config_data.get('url_switch_interval'),
@@ -146,7 +161,7 @@ def build_consumer_kwargs(config_name, config_data, **callbacks):
     }
 
 
-def build_temporary_test_consumer_kwargs(config_name, config_data, **callbacks):
+def build_temporary_test_consumer_kwargs(config_name: str, config_data: dict[str, Any] | None, **callbacks: Any) -> dict[str, Any]:
     """构建一次性临时测试任务，避免调度参数把“立即验证”变成“继续等待”。"""
     kwargs = build_consumer_kwargs(config_name, config_data, **callbacks)
     original_limit = kwargs.get("traffic_limit")
@@ -168,27 +183,27 @@ def build_temporary_test_consumer_kwargs(config_name, config_data, **callbacks):
     return kwargs
 
 
-def build_socket_callbacks(config_name):
+def build_socket_callbacks(config_name: str) -> dict[str, Any]:
     """统一生成 Web 运行态回调，避免多个入口各自拼接日志与事件 payload。"""
-    def log_emitter(message, color=None, _config_name=config_name):
+    def log_emitter(message: Any, color: Any = None, _config_name: str = config_name) -> None:
         if isinstance(message, dict):
             color = message.get('color', color)
             message = message.get('message', '')
-        plain_message = strip_ansi(message or '')
-        color_value = COLOR_TO_CSS.get(color, color)
+        plain_message = strip_ansi(str(message or ''))
+        color_value = COLOR_TO_CSS.get(str(color or ""), str(color))
         if not log_enabled:
             return
-        payload = {'message': plain_message, 'config': _config_name}
+        payload: dict[str, Any] = {'message': plain_message, 'config': _config_name}
         if color_value:
             payload['color'] = color_value
         socketio.emit('log_message', payload)
 
-    def history_emitter(record, _config_name=config_name):
+    def history_emitter(record: Any, _config_name: str = config_name) -> None:
         payload = dict(record or {})
         payload['config'] = _config_name
         socketio.emit('history_update', payload)
 
-    def invalid_url_emitter(payload, _config_name=config_name):
+    def invalid_url_emitter(payload: Any, _config_name: str = config_name) -> None:
         event_payload = dict(payload or {})
         event_payload['config'] = _config_name
         socketio.emit('invalid_url', event_payload)
@@ -200,39 +215,39 @@ def build_socket_callbacks(config_name):
     }
 
 
-def resolve_runtime_state(snapshot):
+def resolve_runtime_state(snapshot: RuntimeSnapshot) -> str:
     """把运行态快照映射成前端可直接展示的状态标签。"""
-    if snapshot['has_active_download']:
+    if snapshot.get('has_active_download'):
         return 'running'
     if snapshot['has_active_scheduler']:
         return 'scheduled'
     return 'stopped'
 
 
-def build_idle_status_payload(snapshot, *, primary=None):
+def build_idle_status_payload(snapshot: RuntimeSnapshot, *, primary: Any | None = None) -> dict[str, Any]:
     """构建非活跃下载阶段的状态数据，例如等待调度或完全停止。"""
-    primary = primary or (snapshot['primary']['consumer'] if snapshot['primary'] else None)
+    primary = primary or ((snapshot.get('primary') or {}).get('consumer') if snapshot.get('primary') else None)
     return {
-        'running': snapshot['has_active_download'] or snapshot['has_active_scheduler'],
+        'running': snapshot.get('has_active_download') or snapshot.get('has_active_scheduler'),
         'state': resolve_runtime_state(snapshot),
         'thread_status': {},
-        'thread_count': snapshot['thread_count'] if snapshot['thread_count'] else (primary.threads if primary else 0),
-        'config': ', '.join(snapshot['config_names']) if snapshot['config_names'] else (primary.config_name if primary else None),
+        'thread_count': snapshot.get('thread_count') if snapshot.get('thread_count') else (primary.threads if primary else 0),
+        'config': ', '.join(snapshot.get('config_names', [])) if snapshot.get('config_names') else (primary.config_name if primary else None),
         'url_usage_stats': [],
     }
 
 
-def is_auto_start_runtime(consumer):
+def is_auto_start_runtime(consumer: Any) -> bool:
     """判断实例是否由自启动列表托管，便于临时测试结束后恢复到原来的运行池。"""
     if not consumer:
         return False
     return any(item.get('consumer') is consumer for item in auto_start_instances)
 
 
-def get_runtime_records():
+def get_runtime_records() -> list[dict[str, Any]]:
     """收集当前所有运行态消费者，自动去重。"""
     with consumer_lock:
-        records = []
+        records: list[dict[str, Any]] = []
         if consumer_instance:
             records.append({
                 'name': consumer_instance.config_name,
@@ -271,10 +286,10 @@ def get_runtime_records():
     return unique_records
 
 
-def get_runtime_snapshot():
+def get_runtime_snapshot() -> RuntimeSnapshot:
     """返回运行态快照，便于状态面板和启动逻辑统一判断。"""
-    records = get_runtime_records()
-    active_records = []
+    records: list[dict[str, Any]] = get_runtime_records()
+    active_records: list[dict[str, Any]] = []
     scheduled_records = []
 
     for record in records:
@@ -308,7 +323,7 @@ def get_runtime_snapshot():
     }
 
 
-def build_plan_summary(record, stats_summary_map=None):
+def build_plan_summary(record: dict[str, Any], stats_summary_map: dict[str, dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """生成单个运行计划的摘要信息，供列表和详情弹窗使用。"""
     consumer = record.get('consumer')
     if not consumer:
@@ -347,12 +362,12 @@ def build_plan_summary(record, stats_summary_map=None):
     }
 
 
-def get_plan_summaries():
+def get_plan_summaries() -> list[dict[str, Any]]:
     """收集所有运行中的计划摘要。"""
     snapshot = get_runtime_snapshot()
     stats_summary_map = build_stats_summary_by_config()
-    plans = []
-    for record in snapshot['records']:
+    plans: list[dict[str, Any]] = []
+    for record in snapshot.get('records', []):
         if record.get('temp_test'):
             continue
         summary = build_plan_summary(record, stats_summary_map=stats_summary_map)
@@ -361,7 +376,7 @@ def get_plan_summaries():
     return plans
 
 
-def _collect_plan_detail_history(config_name):
+def _collect_plan_detail_history(config_name: str) -> list[dict[str, Any]]:
     """汇总某个计划的执行历史，优先从内存态与 stats.json 合并。"""
     target = str(config_name or "").strip()
     if not target:
@@ -371,7 +386,7 @@ def _collect_plan_detail_history(config_name):
     seen = set()
 
     snapshot = get_runtime_snapshot()
-    for record in snapshot['records']:
+    for record in snapshot.get('records', []):
         consumer = record.get('consumer')
         if not consumer or consumer.config_name != target:
             continue
@@ -387,7 +402,7 @@ def _collect_plan_detail_history(config_name):
         try:
             with open(STATS_FILE, 'r', encoding='utf-8') as f:
                 stats_data = json.load(f)
-            for run_id, stats in sorted(stats_data.items(), key=lambda x: x[0], reverse=True):
+            for _run_id, stats in sorted(stats_data.items(), key=lambda x: x[0], reverse=True):
                 if stats.get('config_name') != target:
                     continue
                 record = {
@@ -408,7 +423,7 @@ def _collect_plan_detail_history(config_name):
     return merged[:50]
 
 
-def stop_runtime_config(config_name, wait_thread=False):
+def stop_runtime_config(config_name: str, wait_thread: bool = False) -> bool:
     """仅停止指定名称的运行实例，避免多自启动场景误伤其他配置。"""
     global consumer_instance, consumer_thread
     target_name = str(config_name or "").strip()
@@ -483,7 +498,7 @@ def stop_runtime_config(config_name, wait_thread=False):
     return bool(primary_consumer or auto_start_items or temp_test_items or stopped)
 
 
-def stop_current_consumer(wait_thread=False):
+def stop_current_consumer(wait_thread: bool = False) -> bool:
     """停止当前下载与调度器；返回是否确实停止过任务。"""
     global consumer_instance, consumer_thread
     runtime_records = get_runtime_records()
@@ -508,7 +523,7 @@ def stop_current_consumer(wait_thread=False):
 
     return stopped
 
-def status_emitter():
+def status_emitter() -> None:
     """定期向前端发送状态更新"""
     while not status_thread_stop.is_set():
         snapshot = get_runtime_snapshot()
@@ -554,7 +569,7 @@ def status_emitter():
             socketio.emit('status_update', build_idle_status_payload(snapshot))
         socketio.sleep(1)
 
-def scheduler_status_emitter():
+def scheduler_status_emitter() -> None:
     """定期向前端发送调度器状态更新"""
     while not status_thread_stop.is_set():
         snapshot = get_runtime_snapshot()
@@ -627,7 +642,7 @@ def handle_connect():
     emit('status_update', build_idle_status_payload(snapshot, primary=primary))
 
 
-def launch_auto_start_configs():
+def launch_auto_start_configs() -> bool:
     """启动所有标记为自启动的保存配置：无调度时立即执行，有调度时进入等待态。"""
     global consumer_instance, consumer_thread
     config_names = find_auto_start_configs()
@@ -685,13 +700,13 @@ def launch_auto_start_configs():
     return False
 
 @socketio.on('toggle_logs')
-def handle_toggle_logs(data):
+def handle_toggle_logs(data: dict[str, Any]) -> None:
     """切换日志发送状态"""
     global log_enabled
-    log_enabled = data.get('enabled', False)
+    log_enabled = bool(data.get('enabled', False))
 
 @socketio.on('start_consumer')
-def handle_start(data):
+def handle_start(data: dict[str, Any]) -> None:
     """启动流量消耗器"""
     global consumer_instance, consumer_thread
 
@@ -738,17 +753,17 @@ def handle_start(data):
 
 
 @socketio.on('start_temp_test')
-def handle_start_temp_test(data):
+def handle_start_temp_test(data: dict[str, Any]) -> None:
     """使用当前配置执行一次受限的临时测试，忽略调度参数。"""
     global consumer_instance, consumer_thread, temp_test_instances
 
     runtime_snapshot = get_runtime_snapshot()
     config_name = data.get('config_name') or data.get('name')
-    if runtime_snapshot['has_active_download']:
+    if runtime_snapshot.get('has_active_download'):
         emit('error', {'message': '已有下载任务正在运行，请先停止后再发起临时测试。'})
         return
 
-    scheduled_records = runtime_snapshot['scheduled_records']
+    scheduled_records = runtime_snapshot.get('scheduled_records', [])
     resume_target = None
     if scheduled_records:
         if len(scheduled_records) > 1:
@@ -785,6 +800,7 @@ def handle_start_temp_test(data):
     def run_temp_test():
         """运行临时测试并在完成后清理临时实例，避免页面残留假运行态。"""
         global consumer_instance, consumer_thread
+        resume_info = None
         try:
             temp_consumer.start()
         finally:
@@ -795,35 +811,36 @@ def handle_start_temp_test(data):
                 )
                 resume_info = current_item.get('resume_target') if current_item else None
                 temp_test_instances[:] = [item for item in temp_test_instances if item.get('consumer') is not temp_consumer]
-            if not resume_info:
-                return
 
-            restored_consumer = TrafficConsumer(**build_consumer_kwargs(
-                resume_info['name'],
-                resume_info['config'],
-                **build_socket_callbacks(resume_info['name']),
-            ))
-            restored_thread = threading.Thread(
-                target=restored_consumer.start,
-                name=f"resume-{resume_info['name']}",
-            )
-            restored_thread.daemon = True
+        if not resume_info:
+            return
 
-            with consumer_lock:
-                if resume_info.get('auto_start'):
-                    auto_start_instances.append({
-                        'name': resume_info['name'],
-                        'consumer': restored_consumer,
-                        'thread': restored_thread,
-                    })
-                    if consumer_instance is None:
-                        consumer_instance = restored_consumer
-                        consumer_thread = restored_thread
-                else:
+        restored_consumer = TrafficConsumer(**build_consumer_kwargs(
+            resume_info['name'],
+            resume_info['config'],
+            **build_socket_callbacks(resume_info['name']),
+        ))
+        restored_thread = threading.Thread(
+            target=restored_consumer.start,
+            name=f"resume-{resume_info['name']}",
+        )
+        restored_thread.daemon = True
+
+        with consumer_lock:
+            if resume_info.get('auto_start'):
+                auto_start_instances.append({
+                    'name': resume_info['name'],
+                    'consumer': restored_consumer,
+                    'thread': restored_thread,
+                })
+                if consumer_instance is None:
                     consumer_instance = restored_consumer
                     consumer_thread = restored_thread
+            else:
+                consumer_instance = restored_consumer
+                consumer_thread = restored_thread
 
-            restored_thread.start()
+        restored_thread.start()
 
     temp_thread = threading.Thread(
         target=run_temp_test,
@@ -846,7 +863,7 @@ def handle_start_temp_test(data):
     })
 
 @socketio.on('stop_consumer')
-def handle_stop():
+def handle_stop() -> None:
     """停止流量消耗器"""
     global consumer_instance, consumer_thread
     if stop_current_consumer(wait_thread=True):
@@ -860,7 +877,7 @@ def handle_stop():
         emit('error', {'message': '流量消耗器未在运行。'})
 
 @socketio.on('stop_scheduler')
-def handle_stop_scheduler():
+def handle_stop_scheduler() -> None:
     """停止调度器"""
     global consumer_instance
     if stop_current_consumer(wait_thread=True):
@@ -875,7 +892,7 @@ def handle_stop_scheduler():
 
 
 @socketio.on('stop_runtime_plan')
-def handle_stop_runtime_plan(data):
+def handle_stop_runtime_plan(data: dict[str, Any]) -> None:
     """停止单个运行计划。"""
     config_name = (data or {}).get('name')
     if not config_name:
@@ -887,7 +904,7 @@ def handle_stop_runtime_plan(data):
         plans = get_plan_summaries()
         next_run_time = None
         job_details_list = []
-        for record in snapshot['records']:
+        for record in snapshot.get('records', []):
             instance = record.get('consumer')
             if not instance or not instance.scheduler or not instance.scheduler.running:
                 continue
@@ -902,10 +919,10 @@ def handle_stop_runtime_plan(data):
                 job_details_list.append(f"{instance.config_name}: Interval {instance.interval} 分钟")
 
         emit('status_update', {
-            'running': snapshot['has_active_download'] or snapshot['has_active_scheduler'],
+            'running': snapshot.get('has_active_download') or snapshot.get('has_active_scheduler'),
             'state': resolve_runtime_state(snapshot),
-            'config': ', '.join(snapshot['config_names']) if snapshot['config_names'] else None,
-            'thread_count': snapshot['thread_count'],
+            'config': ', '.join(snapshot.get('config_names', [])) if snapshot.get('config_names') else None,
+            'thread_count': snapshot.get('thread_count'),
             'message': f'计划 "{config_name}" 已停止。'
         })
         socketio.emit('scheduler_status_update', {
@@ -918,7 +935,7 @@ def handle_stop_runtime_plan(data):
         emit('error', {'message': f'计划 "{config_name}" 未在运行。'})
 
 @socketio.on('get_configs')
-def handle_get_configs():
+def handle_get_configs() -> None:
     """获取所有配置"""
     configs = TrafficConsumer.load_config('_all_')
     if configs:
@@ -927,7 +944,7 @@ def handle_get_configs():
         emit('configs_list', {'configs': []})
 
 @socketio.on('get_config_details')
-def handle_get_config_details(data):
+def handle_get_config_details(data: dict[str, Any]) -> None:
     """获取配置详情"""
     config_name = data.get('name')
     target = data.get('target')
@@ -937,13 +954,13 @@ def handle_get_config_details(data):
 
 
 @socketio.on('get_runtime_plans')
-def handle_get_runtime_plans():
+def handle_get_runtime_plans() -> None:
     """获取运行中的计划列表。"""
     emit('runtime_plans', {'plans': get_plan_summaries()})
 
 
 @socketio.on('get_plan_detail')
-def handle_get_plan_detail(data):
+def handle_get_plan_detail(data: dict[str, Any]) -> None:
     """获取指定计划的历史详情。"""
     config_name = (data or {}).get('name')
     config = TrafficConsumer.load_config(config_name)
@@ -954,7 +971,7 @@ def handle_get_plan_detail(data):
     # 读取当前运行态或持久化配置的详情
     snapshot = get_runtime_snapshot()
     detail_consumer = None
-    for record in snapshot['records']:
+    for record in snapshot.get('records', []):
         consumer = record.get('consumer')
         if consumer and consumer.config_name == config_name:
             detail_consumer = consumer
@@ -966,7 +983,7 @@ def handle_get_plan_detail(data):
     total_bytes = 0
     download_count = 0
     threads = config.get('threads')
-    stats_summary = build_stats_summary_by_config().get(config_name, {})
+    stats_summary = build_stats_summary_by_config().get(str(config_name or ''), {})
     history_total_bytes = int(stats_summary.get('total_bytes_raw', 0) or 0)
     history_download_count = int(stats_summary.get('download_count', 0) or 0)
     if detail_consumer:
@@ -1001,7 +1018,7 @@ def handle_get_plan_detail(data):
     })
 
 @socketio.on('save_config')
-def handle_save_config(data):
+def handle_save_config(data: dict[str, Any]) -> None:
     """保存配置"""
     global consumer_instance, consumer_thread
     config_name = data.get('name')
@@ -1025,7 +1042,7 @@ def handle_save_config(data):
 
 
 @socketio.on('delete_config')
-def handle_delete_config(data):
+def handle_delete_config(data: dict[str, Any]) -> None:
     """删除配置，并同步停掉同名运行计划。"""
     config_name = (data or {}).get('name')
     if not config_name:
